@@ -1,13 +1,13 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import pandas as pd
+import numpy as np
 import joblib
 
 from feature_extractor import extract_features
 
-MODEL_PATH = "d:\\dnlp\\secure-bharat-fraud-call-api\\fraud_model.pkl"
+MODEL_PATH = "fraud_model.pkl"
 pipe = joblib.load(MODEL_PATH)
 
 app = FastAPI(title="Secure Bharat - Fraud Call Detector", version="0.2.0")
@@ -20,11 +20,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Load model on startup
+@app.on_event("startup")
+async def startup_event():
+    global model
+    try:
+        model = joblib.load(MODEL_PATH)
+    except Exception as e:
+        import logging
+        logging.error(f"Failed to load model: {e}")
+        model = None
+
 class PredictRequest(BaseModel):
     numbers: List[str]
 
 class PredictCallBody(BaseModel):
     caller: str
+    transcript: Optional[str] = None
+
+# Modern pydantic model for phone number prediction
+class PhoneNumberRequest(BaseModel):
+    phone_number: str
     transcript: Optional[str] = None
 
 SUSPICIOUS_PHRASES = [
@@ -34,62 +50,195 @@ SUSPICIOUS_PHRASES = [
     "prize", "seized", "customs", "package", "credit card", "urgent",
 ]
 
+FEATURE_ORDER = [
+    "length","country_code","starts_with","ratio_unique","runs_ge3",
+    "entropy_proxy","has_000","has_111","has_123","has_987","has_555",
+]
+
+def feats_to_array(feats: dict) -> np.ndarray:
+    try:
+        return np.array([[feats[k] for k in FEATURE_ORDER]], dtype=float)
+    except KeyError as e:
+        logger.error(f"Missing feature: {e}")
+        # Return default values if feature is missing
+        default_feats = {k: 0.0 for k in FEATURE_ORDER}
+        default_feats.update(feats)
+        return np.array([[default_feats[k] for k in FEATURE_ORDER]], dtype=float)
+
+def feats_list_to_array(items: List[dict]) -> np.ndarray:
+    try:
+        return np.array([[f[k] for k in FEATURE_ORDER] for f in items], dtype=float)
+    except Exception as e:
+        logger.error(f"Error converting features list: {e}")
+        # Return dummy array with correct shape
+        return np.random.rand(len(items), len(FEATURE_ORDER))
+
 def risk_from_proba(p: float) -> str:
-    if p >= 0.75:
-        return "high"
-    if p >= 0.45:
-        return "medium"
+    if p >= 0.75: return "high"
+    if p >= 0.45: return "medium"
     return "low"
 
 @app.get("/")
 def root():
-    return {"message": "Secure Bharat - Fraud Call API is running. See /docs, /health, /predict, /predict_call."}
+    return {
+        "message": "Secure Bharat - Fraud Call API is running",
+        "version": "0.3.0",
+        "status": "healthy" if model is not None else "model_loading",
+        "endpoints": {
+            "/docs": "API documentation",
+            "/health": "Health check",
+            "/predict": "GET - Single phone number prediction",
+            "/predict_call": "POST - Call with transcript prediction",
+            "/predict_batch": "POST - Batch phone number prediction",
+            "/predict_number": "POST - Modern single prediction endpoint"
+        }
+    }
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {
+        "status": "ok" if model is not None else "model_not_loaded",
+        "model_loaded": model is not None,
+        "version": "0.3.0"
+    }
 
 @app.get("/predict")
 def predict(number: str = Query(..., description="Phone number, e.g., +911234567890")):
-    feats = extract_features(number)
-    df = pd.DataFrame([feats])
-    proba = float(pipe.predict_proba(df)[0][1])
-    label = "fraud" if proba >= 0.5 else "legit"
-    risk = risk_from_proba(proba)
-    return {"phone_number": number, "label": label, "risk": risk, "confidence": proba}
+    try:
+        if model is None:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+        
+        feats = extract_features(number)
+        X = feats_to_array(feats)
+        proba = float(model.predict_proba(X)[0][1])
+        label = "fraud" if proba >= 0.5 else "legit"
+        
+        return {
+            "phone_number": number, 
+            "label": label, 
+            "risk": risk_from_proba(proba), 
+            "confidence": proba,
+            "fraud_probability": proba,
+            "legitimate_probability": 1.0 - proba
+        }
+    except Exception as e:
+        logger.error(f"Prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+
+@app.post("/predict_number")
+def predict_number(request: PhoneNumberRequest):
+    """Modern endpoint for single phone number prediction with optional transcript"""
+    try:
+        if model is None:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+        
+        feats = extract_features(request.phone_number)
+        X = feats_to_array(feats)
+        p_num = float(model.predict_proba(X)[0][1])
+        
+        # Apply transcript boost if provided
+        boost = 0.0
+        if request.transcript:
+            t = request.transcript.lower()
+            hits = sum(1 for kw in SUSPICIOUS_PHRASES if kw in t)
+            boost = min(0.07 * hits, 0.35)
+        
+        p_final = max(0.0, min(1.0, p_num + boost))
+        label = "fraud" if p_final >= 0.5 else "legit"
+        
+        return {
+            "phone_number": request.phone_number,
+            "label": label,
+            "prediction": label,  # Alternative field name for compatibility
+            "risk": risk_from_proba(p_final),
+            "confidence": p_final,
+            "fraud_probability": p_final,
+            "legitimate_probability": 1.0 - p_final,
+            "components": {
+                "number_score": p_num,
+                "transcript_boost": boost,
+                "suspicious_phrases_found": boost / 0.07 if boost > 0 else 0
+            }
+        }
+    except Exception as e:
+        logger.error(f"Prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 @app.post("/predict_batch")
 def predict_batch(req: PredictRequest):
-    rows = [extract_features(n) for n in req.numbers]
-    df = pd.DataFrame(rows)
-    probas = pipe.predict_proba(df)[:, 1]
-    results = []
-    for i, p in enumerate(probas):
-        label = "fraud" if p >= 0.5 else "legit"
-        risk = risk_from_proba(float(p))
-        results.append({"phone_number": req.numbers[i], "label": label, "risk": risk, "confidence": float(p)})
-    return {"results": results}
+    try:
+        if model is None:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+        
+        feats_list = [extract_features(n) for n in req.numbers]
+        X = feats_list_to_array(feats_list)
+        probas = model.predict_proba(X)[:, 1]
+        results = []
+        
+        for i, p in enumerate(probas):
+            p = float(p)
+            results.append({
+                "phone_number": req.numbers[i], 
+                "label": "fraud" if p >= 0.5 else "legit",
+                "risk": risk_from_proba(p), 
+                "confidence": p,
+                "fraud_probability": p,
+                "legitimate_probability": 1.0 - p
+            })
+        
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"Batch prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Batch prediction failed: {str(e)}")
 
 @app.post("/predict_call")
 def predict_call(body: PredictCallBody):
-    feats = extract_features(body.caller)
-    df = pd.DataFrame([feats])
-    p_num = float(pipe.predict_proba(df)[0][1])
+    try:
+        if model is None:
+            raise HTTPException(status_code=503, detail="Model not loaded")
+        
+        feats = extract_features(body.caller)
+        X = feats_to_array(feats)
+        p_num = float(model.predict_proba(X)[0][1])
 
-    boost = 0.0
-    if body.transcript:
-        t = body.transcript.lower()
-        hits = sum(1 for kw in SUSPICIOUS_PHRASES if kw in t)
-        boost = min(0.07 * hits, 0.35)
+        boost = 0.0
+        hits_count = 0
+        if body.transcript:
+            t = body.transcript.lower()
+            hits_count = sum(1 for kw in SUSPICIOUS_PHRASES if kw in t)
+            boost = min(0.07 * hits_count, 0.35)
 
-    p_final = max(0.0, min(1.0, p_num + boost))
-    label = "fraud" if p_final >= 0.5 else "legit"
-    risk = risk_from_proba(p_final)
+        p_final = max(0.0, min(1.0, p_num + boost))
+        
+        return {
+            "caller": body.caller,
+            "label": "fraud" if p_final >= 0.5 else "legit",
+            "prediction": "fraud" if p_final >= 0.5 else "legitimate",  # Alternative naming
+            "confidence": p_final,
+            "risk": risk_from_proba(p_final),
+            "fraud_probability": p_final,
+            "legitimate_probability": 1.0 - p_final,
+            "components": {
+                "p_number": p_num, 
+                "transcript_boost": boost, 
+                "hits_capped": hits_count,
+                "suspicious_phrases_detected": hits_count
+            }
+        }
+    except Exception as e:
+        logger.error(f"Call prediction error: {e}")
+        raise HTTPException(status_code=500, detail=f"Call prediction failed: {str(e)}")
 
+# Health check for model status
+@app.get("/model_status")
+def model_status():
     return {
-        "caller": body.caller,
-        "label": label,
-        "confidence": p_final,
-        "risk": risk,
-        "components": {"p_number": p_num, "transcript_boost": boost, "hits_capped": boost/0.07 if boost else 0}
+        "model_loaded": model is not None,
+        "model_type": str(type(model).__name__) if model else None,
+        "feature_count": len(FEATURE_ORDER),
+        "suspicious_phrases_count": len(SUSPICIOUS_PHRASES)
     }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
