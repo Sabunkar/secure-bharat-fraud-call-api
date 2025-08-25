@@ -14,4 +14,4 @@ venv/
 Thumbs.db
 
 # Model files
-*.pkl
+
