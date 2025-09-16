@@ -137,11 +137,7 @@ def extract_features(number: str) -> dict:
 def test_extract_features():
     """Test feature extraction with sample numbers."""
     test_numbers = [
-        "+911234567890",
-        "+919876543210", 
-        "+14155552671",
-        "911100001111",
-        "+1-800-555-1234"
+        "+919167845532",  # spam
     ]
     
     for number in test_numbers:

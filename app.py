@@ -7,7 +7,7 @@ import joblib
 
 from feature_extractor import extract_features
 
-MODEL_PATH = "fraud_model.pkl"
+MODEL_PATH = "D:\dnlp\secure-bharat-fraud-call-api\\fraud_model.pkl"
 pipe = joblib.load(MODEL_PATH)
 
 app = FastAPI(title="Secure Bharat - Fraud Call Detector", version="0.2.0")
